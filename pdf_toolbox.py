@@ -9,8 +9,13 @@
    · 全部功能 100% 本地处理，代码不联网、不上传任何文件
    · 不打包、不加壳、无数字签名伪造 —— 源码完全可见、可审计
    · 仅依赖知名开源库：PyMuPDF / python-docx / openpyxl /
-     python-pptx / pdfplumber / Pillow / tkinterdnd2
+     python-pptx / Pillow(pptx内部用) / tkinterdnd2
    · 不写入注册表、不创建计划任务、不常驻后台
+
+ v1.2 体积优化（去掉 pdfplumber 全家桶）：
+   · 表格提取改用 PyMuPDF 内置 find_tables，图片尺寸用 Pixmap
+   · 打包体积从约 59MB 显著下降
+   · 功能保持不变（PDF转Word/Excel/PPT 全部保留）
 
  v1.1 更新（点击体验优化）：
    · 支持把 PDF / 图片直接拖进窗口，自动填入当前功能
@@ -46,16 +51,16 @@ except Exception:
 
 # ---------- 核心功能库（全部为开源、本地库） ----------
 try:
-    import pymupdf as fitz   # PyMuPDF 新接口（PDF 解析/渲染/合并/拆分/加密）
+    import pymupdf as fitz   # PyMuPDF 新接口（PDF 解析/渲染/合并/拆分/加密 + 表格提取）
 except ImportError:
     import fitz
-from PIL import Image  # Pillow：图片处理
 
+# 图片处理：优先用 PyMuPDF（体积小），python-pptx 需要 Pillow 时再引入
 try:
-    import pdfplumber  # 表格提取（PDF 转 Excel）
-    _HAS_PLUMBER = True
+    from PIL import Image  # Pillow：仅供 python-pptx 内部使用
+    _HAS_PIL = True
 except Exception:
-    _HAS_PLUMBER = False
+    _HAS_PIL = False
 
 try:
     from docx import Document as DocxDocument
@@ -76,7 +81,7 @@ except Exception:
     _HAS_PPTX = False
 
 APP_TITLE = "我的专属安全 PDF 工具箱"
-APP_VER = "1.1"
+APP_VER = "1.2"
 CONFIG_FILE = "_config.json"
 
 
@@ -116,6 +121,32 @@ def fmt_size(n):
 def compress_quality_to_params(level):
     """压缩级别 -> (目标图片最长边像素, JPEG质量)"""
     return {"低": (3000, 80), "中": (1800, 65), "高": (1000, 50)}.get(level, (1800, 65))
+
+
+def _page_tables(page):
+    """用 PyMuPDF 内置 find_tables 提取页面表格（替代 pdfplumber）"""
+    try:
+        tabs = page.find_tables()
+        return [t.extract() for t in tabs.tables]
+    except Exception:
+        return []
+
+
+def _image_size(path):
+    """用 PyMuPDF 读取图片真实像素尺寸（替代 Pillow）"""
+    try:
+        pix = fitz.Pixmap(path)
+        w, h = pix.width, pix.height
+        pix = None
+        return w, h
+    except Exception:
+        try:
+            img = Image.open(path)
+            w, h = img.size
+            img.close()
+            return w, h
+        except Exception:
+            return 0, 0
 
 
 def load_config():
@@ -276,10 +307,9 @@ def images_to_pdf(image_paths, out_path):
     doc = fitz.open()
     try:
         for ip in image_paths:
-            img = Image.open(ip)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            w, h = img.size
+            w, h = _image_size(ip)
+            if w <= 0 or h <= 0:
+                raise ValueError(f"无法读取图片：{ip}")
             page = doc.new_page(width=w, height=h)
             page.insert_image(fitz.Rect(0, 0, w, h), filename=ip)
         doc.save(out_path, garbage=4, deflate=True)
@@ -289,18 +319,24 @@ def images_to_pdf(image_paths, out_path):
 
 
 def pdf_to_word(path, out_path):
-    """PDF 转 Word：文本 + 基础表格"""
+    """PDF 转 Word：文本 + 基础表格（PyMuPDF 提取）"""
     if not _HAS_DOCX:
         raise RuntimeError("缺少 python-docx 库，无法转 Word")
     document = DocxDocument()
-    with pdfplumber.open(path) as pdf:
-        for pno, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            for para in text.split("\n"):
-                if para.strip():
-                    document.add_paragraph(para.strip())
-            tables = page.extract_tables()
-            for t in tables:
+    src = fitz.open(path)
+    try:
+        for pno, page in enumerate(src):
+            # 文本（按块取，尽量保持行序）
+            blocks = page.get_text("blocks")
+            for b in blocks:
+                txt = (b[4] or "").strip()
+                if not txt:
+                    continue
+                for para in txt.split("\n"):
+                    if para.strip():
+                        document.add_paragraph(para.strip())
+            # 表格
+            for t in _page_tables(page):
                 if not t:
                     continue
                 tb = document.add_table(rows=len(t), cols=max(len(r) for r in t))
@@ -309,22 +345,25 @@ def pdf_to_word(path, out_path):
                     for ci, cell in enumerate(row):
                         tb.cell(ri, ci).text = (cell or "").strip()
                 document.add_paragraph()
-            if pno != len(pdf.pages) - 1:
+            if pno != src.page_count - 1:
                 document.add_page_break()
-    document.save(out_path)
-    return out_path
+        document.save(out_path)
+        return out_path
+    finally:
+        src.close()
 
 
 def pdf_to_excel(path, out_path):
-    """PDF 转 Excel：每页表格写入独立工作表"""
+    """PDF 转 Excel：每页表格写入独立工作表（PyMuPDF 提取）"""
     if not _HAS_XLSX:
         raise RuntimeError("缺少 openpyxl 库，无法转 Excel")
     wb = Workbook()
     wb.remove(wb.active)
-    with pdfplumber.open(path) as pdf:
+    src = fitz.open(path)
+    try:
         table_count = 0
-        for pno, page in enumerate(pdf.pages):
-            tables = page.extract_tables()
+        for pno, page in enumerate(src):
+            tables = _page_tables(page)
             if tables:
                 for t in tables:
                     if not t:
@@ -335,14 +374,16 @@ def pdf_to_excel(path, out_path):
                         for ci, cell in enumerate(row):
                             ws.cell(row=ri+1, column=ci+1, value=(cell or "").strip())
             else:
-                text = page.extract_text() or ""
+                text = page.get_text() or ""
                 ws = wb.create_sheet(title=f"第{pno+1}页"[:31])
                 for li, line in enumerate(text.split("\n")):
                     ws.cell(row=li+1, column=1, value=line.strip())
-    if not wb.sheetnames:
-        wb.create_sheet(title="空")
-    wb.save(out_path)
-    return out_path
+        if not wb.sheetnames:
+            wb.create_sheet(title="空")
+        wb.save(out_path)
+        return out_path
+    finally:
+        src.close()
 
 
 def pdf_to_ppt(path, out_path, dpi=150):
@@ -358,9 +399,7 @@ def pdf_to_ppt(path, out_path, dpi=150):
             png = os.path.join(os.path.dirname(out_path), f"__tmp_page_{i}.png")
             pix.save(png)
             tmp_files.append(png)
-            img = Image.open(png)
-            pw, ph = img.size
-            img.close()
+            pw, ph = pix.width, pix.height
             prs.slide_width = int(pw / 96 * 914400)
             prs.slide_height = int(ph / 96 * 914400)
             slide = prs.slides.add_slide(prs.slide_layouts[6])

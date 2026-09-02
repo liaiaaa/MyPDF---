@@ -1,8 +1,7 @@
 # 我的专属安全 PDF 工具箱 —— 依赖清单
 # 安装：pip install -r requirements.txt
 PyMuPDF>=1.24
-Pillow>=10.0
 python-docx>=1.1
 openpyxl>=3.1
 python-pptx>=0.6.23
-pdfplumber>=0.11
+Pillow>=10.0        # python-pptx 内部依赖（图片解析）
