@@ -1,0 +1,22 @@
+# ===== 我的专属安全 PDF 工具箱 .gitignore =====
+
+# 运行时生成（每台电脑都不同，不该进仓库）
+_config.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本机专属（桌面快捷方式指向本机路径，别人用不了）
+*.lnk
+
+# 测试临时产物
+_test/
+
+# 打包临时目录
+build/
+*.spec.bak
+
+# exe 构建产物：建议放 GitHub Releases（仓库保持源码轻量）
+# 如果你想把 exe 也留在仓库里，删掉下面这行即可
+dist/
