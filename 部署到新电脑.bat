@@ -26,7 +26,7 @@ if not defined PY (
 )
 
 echo [1/3] 检查依赖库是否已安装...
-"%PY%" -c "import fitz,PIL,docx,openpyxl,pptx,pdfplumber" >nul 2>nul
+"%PY%" -c "import fitz,PIL,docx,openpyxl,pptx,tkinterdnd2" >nul 2>nul
 if errorlevel 1 (
     echo [2/3] 正在安装依赖（需要联网，首次约 1-2 分钟）...
     "%PY%" -m pip install -r "requirements.txt"

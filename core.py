@@ -19,6 +19,8 @@ import os
 import re
 import json
 import sys
+import io
+import tempfile
 
 # PyMuPDF：PDF 解析/渲染/合并/拆分/加密 + 表格提取
 try:
@@ -102,13 +104,29 @@ def compress_quality_to_params(level):
     return {"低": (3000, 80), "中": (1800, 65), "高": (1000, 50)}.get(level, (1800, 65))
 
 
+def _clean_table(t):
+    """去掉全空行"""
+    return [row for row in t if any((c or "").strip() for c in row)]
+
+
 def _page_tables(page):
-    """用 PyMuPDF 内置 find_tables 提取页面表格（替代 pdfplumber）"""
-    try:
-        tabs = page.find_tables()
-        return [t.extract() for t in tabs.tables]
-    except Exception:
-        return []
+    """提取页面表格：先按线条策略识别；无边框表格回退到文本对齐策略"""
+    attempts = [
+        {},  # 默认（lines 策略，识别有边框表格）
+        {"vertical_strategy": "text", "horizontal_strategy": "text"},  # 无边框表格
+    ]
+    for kwargs in attempts:
+        try:
+            tabs = page.find_tables(**kwargs)
+            tables = [_clean_table(t.extract()) for t in tabs.tables]
+            # 只保留像表格的结构：至少 2 行且至少 2 列
+            tables = [t for t in tables
+                      if len(t) >= 2 and max((len(r) for r in t), default=0) >= 2]
+            if tables:
+                return tables
+        except Exception:
+            continue
+    return []
 
 
 def _image_size(path):
@@ -215,8 +233,32 @@ def pdf_split(path, out_dir, pages=None):
         src.close()
 
 
+def _rgb_from_pixmap(pix):
+    """把任意颜色空间/带 alpha 的 Pixmap 统一转为纯 RGB"""
+    if pix.colorspace is not None and pix.colorspace.n != 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    if pix.alpha:
+        pix = fitz.Pixmap(pix, 0)  # 去掉 alpha（JPEG 不支持）
+    return pix
+
+
+def _replace_image(src, xref, pil_img, quality):
+    """把 PIL 图像以 JPEG 替换回 PDF，并同步尺寸/过滤器/颜色空间"""
+    buf = io.BytesIO()
+    pil_img.save(buf, "JPEG", quality=quality, optimize=True)
+    # compress=False 存原始 JPEG（默认会把流再 Flate 压缩，与 DCTDecode 冲突）
+    src.update_stream(xref, buf.getvalue(), new=False, compress=False)
+    src.xref_set_key(xref, "Filter", "/DCTDecode")      # 数据现在是 JPEG
+    src.xref_set_key(xref, "DecodeParms", "null")        # 清除旧的 JPEG/PNG 参数
+    src.xref_set_key(xref, "Width", str(pil_img.width))
+    src.xref_set_key(xref, "Height", str(pil_img.height))
+    src.xref_set_key(xref, "ColorSpace", "/DeviceRGB")   # 统一转 RGB 后必须改
+    src.xref_set_key(xref, "SMask", "null")              # JPEG 无透明，去掉残留遮罩
+    src.xref_set_key(xref, "Decode", "null")             # CMYK 图残留的反相数组，RGB 下必须清掉
+
+
 def pdf_compress(path, out_path, level="中"):
-    """压缩：图片降采样 + 二次压缩，可明显减小体积"""
+    """压缩：图片任意比例降采样 + JPEG 二次压缩，可明显减小体积"""
     src = fitz.open(path)
     try:
         target, quality = compress_quality_to_params(level)
@@ -228,13 +270,32 @@ def pdf_compress(path, out_path, level="中"):
                     pix = fitz.Pixmap(src, xref)
                 except Exception:
                     continue
-                if pix.n - pix.alpha > 3:  # CMYK 先转 RGB
-                    pix = fitz.Pixmap(fitz.csRGB, pix)
-                if pix.width > target or pix.height > target:
-                    scale = target / max(pix.width, pix.height)
-                    pix = pix.shrink(int(1 / scale)) if scale < 1 else pix
-                data = pix.tobytes("jpeg", quality)
-                src.update_stream(xref, data)
+                pix = _rgb_from_pixmap(pix)
+                # 计算目标尺寸（任意比例）
+                nw, nh = pix.width, pix.height
+                if max(nw, nh) > target:
+                    scale = target / max(nw, nh)
+                    nw = max(1, int(nw * scale))
+                    nh = max(1, int(nh * scale))
+                # 主路径：PIL 任意比例缩放（PIL 是 python-pptx 固定依赖，始终可用）
+                try:
+                    pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    if (nw, nh) != (pix.width, pix.height):
+                        pil_img = pil_img.resize((nw, nh), Image.LANCZOS)
+                    _replace_image(src, xref, pil_img, quality)
+                except Exception:
+                    # 降级：PyMuPDF 原生整数倍缩放 + JPEG 重编码
+                    factor = max(2, pix.width // nw, pix.height // nh)
+                    if factor > 1:
+                        pix.shrink(factor)
+                    src.update_stream(xref, pix.tobytes("jpeg", quality),
+                                      new=False, compress=False)
+                    src.xref_set_key(xref, "Filter", "/DCTDecode")
+                    src.xref_set_key(xref, "DecodeParms", "null")
+                    src.xref_set_key(xref, "Width", str(pix.width))
+                    src.xref_set_key(xref, "Height", str(pix.height))
+                    src.xref_set_key(xref, "ColorSpace", "/DeviceRGB")
+                    src.xref_set_key(xref, "Decode", "null")
                 pix = None
         src.save(out_path, garbage=4, deflate=True)
         return out_path
@@ -298,13 +359,18 @@ def images_to_pdf(image_paths, out_path):
 
 
 def pdf_to_word(path, out_path):
-    """PDF 转 Word：文本 + 基础表格（PyMuPDF 提取）"""
+    """PDF 转 Word：文本 + 基础表格 + 页面图片（尽量不丢内容）"""
     if not _HAS_DOCX:
         raise RuntimeError("缺少 python-docx 库，无法转 Word")
     document = DocxDocument()
     src = fitz.open(path)
     try:
         for pno, page in enumerate(src):
+            # 含内嵌图片的页：先把整页渲染成图插入，保证原图不丢
+            if page.get_images(full=True):
+                pix = page.get_pixmap(dpi=110)
+                document.add_picture(io.BytesIO(pix.tobytes("png")))
+                document.add_paragraph()
             # 文本（按块取，尽量保持行序）
             blocks = page.get_text("blocks")
             for b in blocks:
@@ -366,25 +432,29 @@ def pdf_to_excel(path, out_path):
 
 
 def pdf_to_ppt(path, out_path, dpi=150):
-    """PDF 转 PPT：每页渲染为图片放入幻灯片"""
+    """PDF 转 PPT：每页渲染为图片放入幻灯片（统一画布尺寸）"""
     if not _HAS_PPTX:
         raise RuntimeError("缺少 python-pptx 库，无法转 PPT")
     prs = Presentation()
     src = fitz.open(path)
     tmp_files = []
     try:
+        if src.page_count == 0:
+            raise ValueError("PDF 没有页面，无法转换")
+        # 用第一页确定整份演示文稿的统一画布尺寸
+        first = src[0].get_pixmap(dpi=dpi)
+        prs.slide_width = int(first.width / 96 * 914400)
+        prs.slide_height = int(first.height / 96 * 914400)
         for i, page in enumerate(src):
             pix = page.get_pixmap(dpi=dpi)
-            png = os.path.join(os.path.dirname(out_path), f"__tmp_page_{i}.png")
+            png = os.path.join(tempfile.gettempdir(),
+                               f"__mypdf_ppt_{i}_{os.getpid()}.png")
             pix.save(png)
             tmp_files.append(png)
-            pw, ph = pix.width, pix.height
-            prs.slide_width = int(pw / 96 * 914400)
-            prs.slide_height = int(ph / 96 * 914400)
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             slide.shapes.add_picture(png, 0, 0,
-                                     width=int(pw / 96 * 914400),
-                                     height=int(ph / 96 * 914400))
+                                     width=int(pix.width / 96 * 914400),
+                                     height=int(pix.height / 96 * 914400))
         prs.save(out_path)
         return out_path
     finally:
